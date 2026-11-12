@@ -888,6 +888,16 @@ class RawOpenAIChatClient(
             inner_exception=ex,
         ) from ex
 
+    def _raise_for_failed_response(self, response: OpenAIResponse | ParsedResponse[BaseModel]) -> None:
+        """Surface terminal provider failures before returning any response output."""
+        if response.status == "failed":
+            error_details = (
+                f"{response.error.code}: {response.error.message}"
+                if response.error is not None
+                else "No error details."
+            )
+            self._handle_request_error(RuntimeError(f"OpenAI response failed (id={response.id}): {error_details}"))
+
     @override
     async def close(self) -> None:
         """Close the connector-owned SDK connection, not caller-supplied credentials."""
@@ -1002,6 +1012,13 @@ class RawOpenAIChatClient(
                             # surface the served-model header.
                             async with client.responses.stream(**run_options) as response:
                                 async for chunk in response:
+                                    if (
+                                        (chunk.type == "response.created" or chunk.type == "response.failed")
+                                        and chunk.response.status == "failed"
+                                        and isinstance(options, dict)
+                                    ):
+                                        # A failed response invalidates any exposed background token.
+                                        options.pop("continuation_token", None)
                                     yield self._parse_chunk_from_openai(
                                         chunk,
                                         options=validated_options,
@@ -1015,6 +1032,13 @@ class RawOpenAIChatClient(
                             served_model = self._extract_served_model(getattr(raw_create_response, "headers", None))
                             async with _open_event_stream(raw_create_response) as stream_response:
                                 async for chunk in stream_response:
+                                    if (
+                                        (chunk.type == "response.created" or chunk.type == "response.failed")
+                                        and chunk.response.status == "failed"
+                                        and isinstance(options, dict)
+                                    ):
+                                        # A failed response invalidates any exposed background token.
+                                        options.pop("continuation_token", None)
                                     update = self._parse_chunk_from_openai(
                                         chunk,
                                         options=validated_options,
@@ -1044,7 +1068,11 @@ class RawOpenAIChatClient(
                     response = raw_response.parse()
                 except Exception as ex:
                     self._handle_request_error(ex)
-                chat_response = self._parse_response_from_openai(response, options=validated_options)
+                try:
+                    chat_response = self._parse_response_from_openai(response, options=validated_options)
+                finally:
+                    if response.status == "failed" and isinstance(options, dict):
+                        options.pop("continuation_token", None)
                 # See note above on ``raw_stream_response.headers``.
                 served_model = self._extract_served_model(getattr(raw_response, "headers", None))
                 if served_model is not None:
@@ -1069,7 +1097,11 @@ class RawOpenAIChatClient(
                 response = raw_response.parse()
             except Exception as ex:
                 self._handle_request_error(ex)
-            chat_response = self._parse_response_from_openai(response, options=validated_options)
+            try:
+                chat_response = self._parse_response_from_openai(response, options=validated_options)
+            finally:
+                if response.status == "failed" and isinstance(options, dict):
+                    options.pop("continuation_token", None)
             # See note above on ``raw_stream_response.headers``.
             served_model = self._extract_served_model(getattr(raw_response, "headers", None))
             if served_model is not None:
@@ -3541,6 +3573,7 @@ class RawOpenAIChatClient(
         options: dict[str, Any],
     ) -> ChatResponse:
         """Parse an OpenAI Responses API response into a ChatResponse."""
+        self._raise_for_failed_response(response)
         structured_response: BaseModel | None = response.output_parsed if isinstance(response, ParsedResponse) else None  # type: ignore[reportUnknownMemberType]
 
         metadata: dict[str, Any] = response.metadata or {}
@@ -4235,6 +4268,7 @@ class RawOpenAIChatClient(
                 )
                 metadata.update(self._get_metadata_from_response(event))
             case "response.created":
+                self._raise_for_failed_response(event.response)
                 response_id = event.response.id
                 conversation_id = self._get_conversation_id(event.response, options.get("store"))
                 if event.response.status in _TERMINAL_RESPONSE_STATUSES:
@@ -4246,6 +4280,7 @@ class RawOpenAIChatClient(
                 conversation_id = self._get_conversation_id(event.response, options.get("store"))
                 continuation_token = OpenAIContinuationToken(response_id=event.response.id)
             case "response.completed" | "response.incomplete" | "response.failed":
+                self._raise_for_failed_response(event.response)
                 operation_state = "terminal"
                 response_id = event.response.id
                 conversation_id = self._get_conversation_id(event.response, options.get("store"))

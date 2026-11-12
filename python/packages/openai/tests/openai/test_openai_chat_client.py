@@ -55,10 +55,13 @@ from agent_framework.exceptions import (
 )
 from openai import AsyncOpenAI, BadRequestError, DefaultAsyncHttpxClient
 from openai.types.responses import (
+    Response,
     ResponseComputerToolCall,
     ResponseComputerToolCallOutputItem,
     ResponseContentPartDoneEvent,
+    ResponseCreatedEvent,
     ResponseErrorEvent,
+    ResponseFailedEvent,
     ResponseFunctionShellToolCall,
     ResponseFunctionShellToolCallOutput,
     ResponseFunctionToolCall,
@@ -91,6 +94,7 @@ from agent_framework_openai import (
     OpenAIChatClient,
     OpenAIChatCompletionClient,
     OpenAIChatOptions,
+    OpenAIContinuationToken,
     RawOpenAIChatClient,
     RawOpenAIChatCompletionClient,
 )
@@ -10499,7 +10503,7 @@ def test_streaming_error_event_raises_chat_client_exception() -> None:
     assert "OpenAI streaming error: server_error: The response stream failed. (parameter: input)" in str(exc_info.value)
 
 
-@pytest.mark.parametrize("request_path", ["create", "structured", "resume"])
+@pytest.mark.parametrize("request_path", ["create", "background", "structured", "resume"])
 @pytest.mark.parametrize("code", ["server_error", "rate_limit_exceeded", None])
 @pytest.mark.parametrize("error_param", ["input", None])
 async def test_streaming_error_event_preserves_provider_details(
@@ -10515,6 +10519,8 @@ async def test_streaming_error_event_preserves_provider_details(
     )
     events = _FakeAsyncEventStream([error_event])
     options: OpenAIChatOptions[Any] = {}
+    if request_path == "background":
+        options["background"] = True
     if request_path == "structured":
         options["response_format"] = OutputStruct
         request_patch = patch.object(client.client.responses, "stream", return_value=events)
@@ -10522,7 +10528,7 @@ async def test_streaming_error_event_preserves_provider_details(
         method = "retrieve" if request_path == "resume" else "create"
         request_patch = patch.object(client.client.responses.with_raw_response, method, return_value=events)
         if request_path == "resume":
-            options["continuation_token"] = {"response_id": "resp_stream_error"}
+            options["continuation_token"] = OpenAIContinuationToken(response_id="resp_stream_error")
 
     with request_patch, pytest.raises(ChatClientException) as exc_info:
         stream = client._inner_get_response(
@@ -10538,8 +10544,7 @@ async def test_streaming_error_event_preserves_provider_details(
     assert getattr(cause, "message", None) == error_event.message
     assert getattr(cause, "param", None) == error_param
     assert getattr(cause, "event", None) is error_event
-    if request_path == "resume":
-        assert "continuation_token" not in options
+    assert "continuation_token" not in options
 
 
 @pytest.mark.parametrize(
@@ -10615,6 +10620,258 @@ async def test_resumed_stream_error_clears_continuation_token() -> None:
     assert "continuation_token" not in options
 
 
+async def test_background_stream_connection_error_preserves_continuation_token() -> None:
+    client = OpenAIChatClient(model="test-model", api_key="test-key")
+    created_event = ResponseCreatedEvent.model_validate({
+        "type": "response.created",
+        "sequence_number": 0,
+        "response": {
+            "id": "resp_interrupted",
+            "object": "response",
+            "created_at": 1.0,
+            "model": "test-model",
+            "status": "in_progress",
+            "error": None,
+            "output": [],
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+        },
+    })
+    connection_error = ConnectionError("Connection dropped")
+
+    async def interrupted_events() -> AsyncIterable[ResponseStreamEvent]:
+        yield created_event
+        raise connection_error
+
+    raw_response = MagicMock()
+    raw_response.parse.return_value.__aenter__.return_value = interrupted_events()
+    options: OpenAIChatOptions[Any] = {"background": True}
+    exposed_tokens = []
+    with (
+        patch.object(client.client.responses.with_raw_response, "create", return_value=raw_response),
+        pytest.raises(ChatClientException, match="Connection dropped") as exc_info,
+    ):
+        result = client._inner_get_response(
+            messages=[Message(role="user", contents=["test"])], options=options, stream=True
+        )
+        assert isinstance(result, ResponseStream)
+        async for update in result:
+            if update.continuation_token is not None:
+                options["continuation_token"] = cast(OpenAIContinuationToken, update.continuation_token)
+                exposed_tokens.append(update.continuation_token)
+
+    assert exposed_tokens == [{"response_id": "resp_interrupted"}]
+    assert options.get("continuation_token") == {"response_id": "resp_interrupted"}
+    assert exc_info.value.__cause__ is connection_error
+
+
+@pytest.mark.parametrize("request_path", ["create", "background", "structured", "resume"])
+@pytest.mark.parametrize("event_type", [None, "response.failed", "response.created"])
+@pytest.mark.parametrize("with_error", [True, False])
+async def test_failed_response_raises_and_clears_resume_token(
+    request_path: str, event_type: str | None, with_error: bool
+) -> None:
+    client = OpenAIChatClient(model="test-model", api_key="test-key")
+    response = Response.model_validate({
+        "id": "resp_failed",
+        "object": "response",
+        "created_at": 1.0,
+        "model": "test-model",
+        "status": "failed",
+        "error": {"code": "server_error", "message": "Generation failed."} if with_error else None,
+        "output": [],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+    options: OpenAIChatOptions[Any] = {}
+    if request_path == "background":
+        options["background"] = True
+    if request_path == "structured":
+        options["response_format"] = OutputStruct
+    if request_path == "resume":
+        options["continuation_token"] = OpenAIContinuationToken(response_id=response.id)
+
+    if event_type is None:
+        raw_response = MagicMock()
+
+        def parse_response() -> Response:
+            if request_path == "background":
+                # Simulate a caller retaining a token while the fresh request is in flight.
+                options["continuation_token"] = OpenAIContinuationToken(response_id=response.id)
+            return response
+
+        raw_response.parse.side_effect = parse_response
+        method = {"create": "create", "background": "create", "structured": "parse", "resume": "retrieve"}[request_path]
+        request_patch = patch.object(client.client.responses.with_raw_response, method, return_value=raw_response)
+    else:
+        event_class = ResponseFailedEvent if event_type == "response.failed" else ResponseCreatedEvent
+        event = event_class.model_validate({"type": event_type, "sequence_number": 1, "response": response})
+        preceding_events = []
+        if request_path == "background":
+            preceding_events.append(
+                ResponseCreatedEvent.model_validate({
+                    "type": "response.created",
+                    "sequence_number": 0,
+                    "response": {**response.model_dump(), "status": "in_progress", "error": None},
+                })
+            )
+        events = _FakeAsyncEventStream([*preceding_events, event])
+        if request_path == "structured":
+            request_patch = patch.object(client.client.responses, "stream", return_value=events)
+        else:
+            method = "retrieve" if request_path == "resume" else "create"
+            request_patch = patch.object(client.client.responses.with_raw_response, method, return_value=events)
+
+    exposed_tokens = []
+    with request_patch, pytest.raises(ChatClientException, match="OpenAI response failed") as exc_info:
+        result = client._inner_get_response(
+            messages=[Message(role="user", contents=["test"])], options=options, stream=event_type is not None
+        )
+        if isinstance(result, ResponseStream):
+            async for update in result:
+                if request_path == "background" and update.continuation_token is not None:
+                    # A caller can retain a token exposed before the terminal failure.
+                    options["continuation_token"] = cast(OpenAIContinuationToken, update.continuation_token)
+                    exposed_tokens.append(update.continuation_token)
+        else:
+            await result
+
+    if request_path == "background" and event_type is not None:
+        assert exposed_tokens == [{"response_id": response.id}]
+    assert response.id in str(exc_info.value)
+    if not with_error:
+        assert "No error details." in str(exc_info.value)
+    if with_error:
+        assert "server_error: Generation failed." in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert "continuation_token" not in options
+
+
+@pytest.mark.parametrize(
+    ("status", "incomplete_reason", "expected_finish_reason"),
+    [
+        ("completed", None, "stop"),
+        ("incomplete", "content_filter", "content_filter"),
+        ("incomplete", "max_output_tokens", "length"),
+        ("cancelled", None, None),
+    ],
+)
+async def test_non_streaming_terminal_response_status_is_preserved(
+    status: str, incomplete_reason: str | None, expected_finish_reason: str | None
+) -> None:
+    client = OpenAIChatClient(model="test-model", api_key="test-key")
+    response = Response.model_validate({
+        "id": "resp_terminal",
+        "object": "response",
+        "created_at": 1.0,
+        "model": "test-model",
+        "status": status,
+        "error": None,
+        "incomplete_details": {"reason": incomplete_reason} if incomplete_reason else None,
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_terminal",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Partial or complete text", "annotations": []}],
+            }
+        ],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+    raw_response = MagicMock()
+    raw_response.parse.return_value = response
+    with patch.object(client.client.responses.with_raw_response, "create", return_value=raw_response):
+        result = await client.get_response(messages=[Message(role="user", contents=["test"])])
+
+    assert result.text == "Partial or complete text"
+    assert result.response_id == response.id
+    assert result.finish_reason == expected_finish_reason
+    assert result.continuation_token is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_failed_response_with_function_call_does_not_invoke_tool(stream: bool) -> None:
+    from openai.types.responses import ResponseFunctionCallArgumentsDeltaEvent, ResponseOutputItemAddedEvent
+
+    invocations: list[str] = []
+
+    @tool(approval_mode="never_require")
+    def lookup(query: str) -> str:
+        """Look up a value."""
+        invocations.append(query)
+        return "value"
+
+    client = OpenAIChatClient(model="test-model", api_key="test-key")
+    function_call = {
+        "type": "function_call",
+        "id": "fc_1",
+        "call_id": "call_1",
+        "name": "lookup",
+        "arguments": '{"query": "x"}',
+        "status": "completed",
+    }
+    response = Response.model_validate({
+        "id": "resp_failed",
+        "object": "response",
+        "created_at": 1.0,
+        "model": "test-model",
+        "status": "failed",
+        "error": {"code": "server_error", "message": "Generation failed."},
+        "output": [function_call],
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+    })
+    if stream:
+        create_result: object = _FakeAsyncEventStream([
+            ResponseOutputItemAddedEvent.model_validate({
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": function_call,
+            }),
+            ResponseFunctionCallArgumentsDeltaEvent.model_validate({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": 2,
+                "output_index": 0,
+                "item_id": "fc_1",
+                "delta": function_call["arguments"],
+            }),
+            ResponseOutputItemDoneEvent.model_validate({
+                "type": "response.output_item.done",
+                "sequence_number": 3,
+                "output_index": 0,
+                "item": function_call,
+            }),
+            ResponseFailedEvent.model_validate({"type": "response.failed", "sequence_number": 4, "response": response}),
+        ])
+    else:
+        create_result = MagicMock()
+        create_result.parse.return_value = response
+
+    updates: list[ChatResponseUpdate] = []
+    with (
+        patch.object(client.client.responses.with_raw_response, "create", return_value=create_result) as create,
+        pytest.raises(ChatClientException, match="server_error: Generation failed."),
+    ):
+        messages = [Message(role="user", contents=["test"])]
+        if stream:
+            async for update in client.get_response(messages=messages, options={"tools": [lookup]}, stream=True):
+                updates.append(update)
+        else:
+            await client.get_response(messages=messages, options={"tools": [lookup]})
+
+    if stream:
+        assert any(content.type == "function_call" for update in updates for content in update.contents)
+    assert invocations == []
+    assert create.call_count == 1
+
+
 def test_streaming_response_created_with_in_progress_status_sets_continuation_token() -> None:
     """Test that response.created with in_progress status sets continuation_token."""
     client = OpenAIChatClient(model="test-model", api_key="test-key")
@@ -10635,7 +10892,7 @@ def test_streaming_response_created_with_in_progress_status_sets_continuation_to
     assert _response_id_from_token(update.continuation_token) == "resp_created_123"
 
 
-@pytest.mark.parametrize("status", ["completed", "failed", "incomplete", "cancelled"])
+@pytest.mark.parametrize("status", ["completed", "incomplete", "cancelled"])
 def test_streaming_response_created_with_terminal_status_clears_continuation_token(status: str) -> None:
     """A terminal status embedded in response.created should terminate the operation."""
     client = OpenAIChatClient(model="test-model", api_key="test-key")
@@ -10781,7 +11038,6 @@ def test_parse_response_from_openai_sets_finish_reason() -> None:
         ("response.completed", "completed", None, "function_call", "tool_calls"),
         ("response.incomplete", "incomplete", "max_output_tokens", None, "length"),
         ("response.incomplete", "incomplete", "content_filter", None, "content_filter"),
-        ("response.failed", "failed", None, None, None),
     ],
 )
 def test_streaming_terminal_response_sets_finish_reason(
@@ -10815,7 +11071,6 @@ def test_streaming_terminal_response_sets_finish_reason(
 @pytest.mark.parametrize(
     ("event_type", "status", "incomplete_reason"),
     [
-        ("response.failed", "failed", None),
         ("response.incomplete", "incomplete", "other"),
     ],
 )
